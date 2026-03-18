@@ -7,121 +7,133 @@ from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# --- 1. 初始化瀏覽器 (針對 Streamlit Cloud 優化) ---
+# --- 瀏覽器初始化 ---
 def init_driver():
     options = Options()
-    options.add_argument("--headless=new")  # 雲端必須開啟無頭模式
+    options.add_argument("--headless=new") # 雲端執行必備
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     options.add_argument("--lang=zh-TW")
     
-    # Streamlit Cloud 的 Chromium 預設路徑
-    options.binary_location = "/usr/bin/chromium"
-    service = Service("/usr/bin/chromedriver")
-    
+    # 強制指向 Streamlit Cloud 的路徑
+    if os.path.exists("/usr/bin/chromium"):
+        options.binary_location = "/usr/bin/chromium"
+        
     try:
-        driver = webdriver.Chrome(service=service, options=options)
-        return driver
-    except Exception as e:
-        st.error(f"瀏覽器啟動失敗，嘗試備用方案... 錯誤: {e}")
-        # 備用方案：交給 Selenium 自動尋找
+        # 優先嘗試系統路徑
+        service = Service("/usr/bin/chromedriver")
+        return webdriver.Chrome(service=service, options=options)
+    except:
+        # 備用方案
         return webdriver.Chrome(options=options)
 
-# --- 2. 爬蟲核心邏輯 ---
-def scrape_google_reviews(driver, shop_name, max_reviews=20):
-    wait = WebDriverWait(driver, 20)
-    
-    # 搜尋店家
-    driver.get(f"https://www.google.com.tw/maps/search/{shop_name}")
-    time.sleep(5)
-    
+# --- 爬蟲邏輯 ---
+def scrape_google_reviews(driver, shop_name, max_count=10):
+    wait = WebDriverWait(driver, 15)
+    # 使用 Google 搜尋進入點，最穩定
+    driver.get(f"https://www.google.com/search?q={shop_name}+評論")
+    time.sleep(3)
+
     try:
-        # 點擊評論分頁
-        reviews_tab = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//button[contains(@aria-label, '評論') or .//div[contains(text(),'評論')]]")
-        ))
-        reviews_tab.click()
+        # 尋找「Google 評論」按鈕
+        triggers = [
+            "//a[contains(@data-async-trigger, 'review')]",
+            "//a[contains(text(), '則評論')]",
+            "//span[contains(text(), 'Google 評論')]"
+        ]
+        
+        btn_found = False
+        for xpath in triggers:
+            try:
+                btn = wait.until(EC.element_to_be_clickable((By.XPATH, xpath)))
+                btn.click()
+                btn_found = True
+                break
+            except: continue
+            
+        if not btn_found:
+            return None, "找不到評論按鈕，請嘗試更精確的店名。"
+
         time.sleep(3)
         
-        # 滾動加載評論
-        scrollable_div = driver.find_element(By.XPATH, "//div[@role='main' or @role='feed' or contains(@class, 'm67q60')]")
+        reviews_data = []
+        last_height = 0
         
-        collected_data = []
-        last_count = 0
+        # 建立進度條
+        pbar = st.progress(0)
         
-        progress_bar = st.progress(0)
-        
-        while len(collected_data) < max_reviews:
-            # 捲動到底部
-            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scrollable_div)
-            time.sleep(2)
+        # 評論視窗容器
+        container_xpath = "//div[contains(@class, 'review-dialog-list') or @role='main']"
+
+        for i in range(15): # 最多捲動 15 次
+            # 抓取目前的評論
+            items = driver.find_elements(By.XPATH, "//div[@data-review-id] | //div[contains(@class, 'gws-localreviews__google-review')]")
             
-            # 抓取目前的評論元素
-            items = driver.find_elements(By.XPATH, "//div[@data-review-id]")
-            
-            for item in items[last_count:]:
+            for item in items[len(reviews_data):]:
                 try:
                     # 展開全文
                     try:
-                        more_btn = item.find_element(By.XPATH, ".//button[contains(text(), '全文') or contains(text(), 'More')]")
-                        driver.execute_script("arguments[0].click();", more_btn)
+                        more = item.find_element(By.XPATH, ".//a[contains(text(), '全文') or contains(text(), 'More')]")
+                        driver.execute_script("arguments[0].click();", more)
                     except: pass
                     
-                    name = item.find_element(By.CLASS_NAME, "d4r55").text
-                    rating = item.find_element(By.XPATH, ".//span[@role='img']").get_attribute("aria-label")
-                    content = item.find_element(By.CLASS_NAME, "wiI7pd").text
+                    name = item.find_element(By.XPATH, ".//div[contains(@class, 'TS76Pe') or contains(@class, 'd4r55')]").text
+                    content = item.find_element(By.XPATH, ".//span[contains(@class, 'review-full-text') or contains(@class, 'wiI7pd')]").text
+                    reviews_data.append({"姓名": name, "內容": content})
                     
-                    collected_data.append({"姓名": name, "星級": rating, "內容": content})
-                    if len(collected_data) >= max_reviews: break
-                except:
-                    continue
+                    if len(reviews_data) >= max_count: break
+                except: continue
             
-            if len(items) == last_count: # 沒再增加了
-                break
-            last_count = len(items)
-            progress_bar.progress(min(len(collected_data) / max_reviews, 1.0))
+            if len(reviews_data) >= max_count: break
+            
+            # 執行捲動
+            try:
+                scroll_div = driver.find_element(By.XPATH, container_xpath)
+                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight", scroll_div)
+            except:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            
+            time.sleep(2)
+            pbar.progress(min(len(reviews_data)/max_count, 1.0))
+            if len(items) == last_height: break
+            last_height = len(items)
 
-        return collected_data
+        return pd.DataFrame(reviews_data[:max_count]), None
+
     except Exception as e:
-        st.error(f"爬取過程發生錯誤: {e}")
-        return []
+        return None, str(e)
 
-# --- 3. Streamlit 介面 ---
-st.set_page_config(page_title="Google Maps 評論爬蟲", layout="wide")
-st.title("📍 Google Maps 評論爬蟲工具")
+# --- Streamlit 介面 ---
+st.set_page_config(page_title="Google 評論爬蟲", page_icon="📝")
+st.title("📝 Google 評論全自動爬蟲")
+st.caption("適應於 Streamlit Cloud 環境之 Selenium 爬蟲")
 
-col1, col2 = st.columns(2)
-with col1:
-    target_shop = st.text_input("輸入店家名稱：", placeholder="例如：十二段東山店")
-with col2:
-    num_reviews = st.number_input("預計抓取數量：", min_value=5, max_value=100, value=20)
+with st.sidebar:
+    st.header("參數設定")
+    shop_input = st.text_input("店家名稱", value="十二段東山店")
+    count_input = st.slider("抓取數量", 5, 50, 10)
+    st.divider()
+    st.write("提示：若失敗請嘗試加入城市名，如「台中十二段東山店」。")
 
-if st.button("開始執行爬蟲"):
-    if not target_shop:
-        st.warning("請輸入店家名稱！")
-    else:
-        with st.spinner(f"正在分析 {target_shop} ..."):
-            driver = init_driver()
-            results = scrape_google_reviews(driver, target_shop, num_reviews)
-            driver.quit()
+if st.button("🚀 開始爬取資料", use_container_width=True):
+    with st.spinner("正在啟動瀏覽器並搜尋..."):
+        driver = init_driver()
+        df, error = scrape_google_reviews(driver, shop_input, count_input)
+        driver.quit()
+        
+        if error:
+            st.error(f"發生錯誤：{error}")
+        elif df is not None and not df.empty:
+            st.success(f"成功抓取 {len(df)} 則評論！")
+            st.dataframe(df, use_container_width=True)
             
-            if results:
-                df = pd.DataFrame(results)
-                st.success(f"✅ 成功抓取 {len(df)} 則評論")
-                st.dataframe(df, use_container_width=True)
-                
-                # 下載功能
-                csv = df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="📥 下載資料為 CSV",
-                    data=csv,
-                    file_name=f"{target_shop}_reviews.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.error("找不到評論或抓取失敗。")
+            # 下載功能
+            csv = df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button("📥 下載 CSV 結果", csv, f"{shop_input}.csv", "text/csv")
+        else:
+            st.warning("未抓取到任何資料，請確認店名是否正確。")
